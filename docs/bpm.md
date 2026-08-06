@@ -1761,6 +1761,7 @@ integration, admin integration, and timer compatibility.
 | Machine first-pass with human fallback | A + §9 | `stripe_review` |
 | Transient-failure retry inside a handler | §5.7 | `payment_intent` |
 | External events driving transitions | §7.2 | the storefront webhook router |
+| Frontend integration | §7.4 | the shared workflow JS helper |
 
 ### 14.3 Known gaps
 
