@@ -43,12 +43,18 @@ Two audiences:
 (authoring conventions), §7 (web integration) and §12 (gotchas) are the working
 set. §14 is the inventory of the reference implementation.
 
-**Re-implementing BPM in a new product?** Read straight through. Everything
-needed to rebuild the system from an empty repo is here: the five tables
-(§4), all six engine modules with their real implementations (§5), the BPMN
-templates for each canonical process shape (§6), the integration surfaces
-(§7), the test strategy (§10), and — the part that costs the most to
-rediscover — the gotchas (§12). §13 is a phased rollout order.
+**Re-implementing BPM in a new product?** Read straight through: the five tables
+(§4), the engine's load-bearing code (§5), the BPMN templates for each canonical
+process shape (§6), the integration surfaces (§7), the test strategy (§10), and
+— the part that costs the most to rediscover — the gotchas (§12). §13 is a
+phased rollout order.
+
+This is a **design spec with the hazards mapped, not a drop-in implementation.**
+An unbriefed reviewer rebuilt the engine from it and shipped a working system
+with 67 passing tests, but had to supply the HTTP/auth layer, the user and role
+model, and one schema column of their own (§5). Expect to write real code from
+these shapes; expect §12 to save you weeks. §14.4 lists what that exercise
+found — five silent defects, all now corrected in the text.
 
 The spec is stack-flavored (Python / FastAPI / SQLAlchemy / MySQL /
 SpiffWorkflow) but the design is portable. The parts that generalize are §1
@@ -265,7 +271,9 @@ CREATE TABLE process_definitions (
 CREATE TABLE process_instances (
   id                     BIGINT PRIMARY KEY AUTO_INCREMENT,
   process_definition_id  INT          NOT NULL,
-  business_key           VARCHAR(100) NOT NULL,   -- '<process_key>:<object_id>'
+  -- MUST exceed process_key + 1 + object_id, or you re-commit the exact
+  -- DataError 1406 -> poisoned-session cascade that §4.1/G16 exist to prevent.
+  business_key           VARCHAR(255) NOT NULL,   -- '<process_key>:<object_id>'
   object_type            VARCHAR(50)  NOT NULL,
   object_id              VARCHAR(100) NOT NULL,   -- see the width warning below
   status                 VARCHAR(20)  NOT NULL,   -- running|completed|error|canceled
@@ -337,7 +345,14 @@ it produced a full traceback every minute forever (§12, G16 and G14). `process_
 `state_transitions` and `ai_invocations` all carry the pair and must all be
 widened together.
 
-**`business_key` is `<process_key>:<object_id>` and is NOT unique.** The
+**`business_key` must be wider than its two components combined.** It is built
+as `f"{process_key}:{object_id}"` from a `VARCHAR(100)` and a `VARCHAR(100)`, so
+`VARCHAR(100)` cannot hold it — up to 201 characters are possible. Shipping it
+at 100 re-creates, in the very schema presented as the fix, the `DataError 1406`
+→ `PendingRollbackError` cascade described two paragraphs above. Latent only
+while keys stay short. Size it at 255.
+
+**`business_key` is NOT unique.** The
 original design had a unique constraint. It was dropped deliberately: an object
 can legitimately have a *sequence* of lifecycles over time (a gear item that is
 acquired, sold, re-acquired). Uniqueness is enforced at the *behavior* level —
@@ -347,8 +362,15 @@ acquired, sold, re-acquired). Uniqueness is enforced at the *behavior* level —
 recent terminal one.
 
 **`current_states` is a denormalized JSON array of active task-spec names.** It
-makes "show me every order waiting on payment" a single indexed query instead
-of N deserializations. Rebuilt on every persist.
+answers "show me every order waiting on payment" without N deserializations —
+but note it is a **JSON column and therefore not directly indexable** in MySQL.
+If that query becomes hot, add a generated column over the JSON path and index
+that; don't assume the array is doing index work it can't do.
+
+**Index names must be unique per *schema*, not per table.** `idx_object` on both
+`process_instances` and `state_transitions` is legal MySQL and fatal on
+PostgreSQL and SQLite. Prefix them (`idx_pi_object`, `idx_st_object`) from the
+start — retrofitting means a migration per site.
 
 **`metadata` is a reserved attribute name in SQLAlchemy's declarative API.** The
 column is named `metadata` in SQL but mapped as
@@ -362,8 +384,20 @@ a task.
 
 ## 5. The engine — six modules
 
-This is the complete implementation. A re-implementation can lift these
-near-verbatim.
+**Scope, honestly.** What follows is the *load-bearing* code — the parts that are
+non-obvious, version-fragile, or were got wrong in production. Where a snippet
+is complete it can be lifted near-verbatim. It is **not** a full drop-in
+implementation: `WorkflowService`'s method bodies are given as the five-beat
+pattern plus the tricky fragments rather than end to end, the ORM mapping over
+§4 is left to you, and the HTTP/auth substrate in §7 is described by contract
+rather than by code.
+
+An independent reviewer who rebuilt the engine from this document alone reported
+that the architecture transfers but the implementation does not: they had to
+invent the HTTP layer, the user/role model, and one schema column
+(`workflow_tasks` carries no identifier for *which* Spiff task a row projects,
+which `task_spec_name` cannot supply once a user task appears inside a loop or a
+parallel branch). Budget for that. The value here is the design and §12.
 
 ### 5.1 `registry.py` — binding BPMN ids to Python
 
@@ -532,16 +566,24 @@ conditions as `evaluate(expr, task.data, external_context=workflow.data_objects)
 
 ```python
 def _apply_initial_data(workflow, seed: dict) -> None:
-    workflow.data.update(seed)            # Spiff-internal lookups
-    workflow.data_objects.update(seed)    # external context for expressions
+    workflow.data.update(seed)            # Spiff-internal lookups + our ctx merge
     for t in workflow.get_tasks(state=TaskState.READY):
         if t.task_spec.__class__.__name__ == "BpmnStartTask":
-            t.data.update(seed)           # inherited by child tasks
+            t.data.update(seed)           # <- the write that actually matters
             break
     else:
         for t in workflow.get_tasks(state=TaskState.READY):
             t.data.update(seed)           # fallback: seed all ready tasks
 ```
+
+> **Do not add `workflow.data_objects.update(seed)`.** It looks like the way to
+> populate the expression evaluator's external context. It does nothing:
+> `data_objects` is a **read-only property** returning
+> `self.data.get('data_objects', {})`, so with no such key it hands back a fresh
+> dict on every access and the update is discarded. Real BPMN data objects
+> require a `<bpmn:dataObject>` declaration. This line sat in production for
+> months with a comment asserting the opposite; the start-task write is what
+> makes gateway conditions resolve.
 
 `signal()` does the same three-way write for its payload, and additionally
 updates **every waiting/ready task's local data** — a condition expression
@@ -572,13 +614,32 @@ renders buttons from this list without knowing anything about the process.
 
 ```python
 def _catchable_signals(workflow) -> list[str]:
-    signals = []
-    for t in workflow.get_tasks(state=TaskState.WAITING):
-        for ed in getattr(t.task_spec, "event_definitions", None) or []:
-            if type(ed).__name__ == "SignalEventDefinition" and getattr(ed, "name", None):
+    signals: list[str] = []
+
+    def _collect(ed):
+        if ed is None:
+            return
+        if type(ed).__name__ == "SignalEventDefinition":
+            if getattr(ed, "name", None):
                 signals.append(ed.name)
+            return
+        for child in getattr(ed, "event_definitions", None) or []:   # composite
+            _collect(child)
+
+    for t in workflow.get_tasks(state=TaskState.WAITING):
+        _collect(getattr(t.task_spec, "event_definition", None))     # SINGULAR
+        for ed in getattr(t.task_spec, "event_definitions", None) or []:
+            _collect(ed)
     return sorted(set(signals))
 ```
+
+> **`event_definition` is singular.** A catch-event spec in 3.1.2 exposes
+> `event_definition`; there is no `event_definitions` attribute on it. Reading
+> the plural returns `[]` for *every* workflow, so `available_actions()` never
+> offers a signal and the buttons below never render — silently, with no error.
+> This shipped and survived undetected precisely because the failure is an empty
+> list rather than an exception. The plural is kept only as a fallback for
+> composite definitions (`MultipleEventDefinition` exposes children that way).
 
 **Task projection is a reconciliation, not an append.** After every step,
 `_reproject_tasks` diffs Spiff's ready user tasks against the `ready` rows in
@@ -662,6 +723,12 @@ job runs every 60s, and for each **running** instance: deserialize →
 **only if something actually moved**.
 
 ```python
+def _completed_count(workflow) -> int:
+    # NOT get_tasks(state=COMPLETED) — see G8. TaskIterator stops descending at
+    # the first ancestor below min_state, so a WAITING gateway hides everything
+    # completed beneath it and the sweep discards real progress.
+    return sum(1 for t in workflow.get_tasks() if t.state == TaskState.COMPLETED)
+
 before = _completed_count(workflow)
 workflow.refresh_waiting_tasks()
 workflow.do_engine_steps()
@@ -675,6 +742,11 @@ names.** A polling loop ends each iteration back at the same
 `timer_wait_30s` spec name — a name-keyed before/after snapshot sees no change
 and never persists, so the loop silently never advances. Completed-count is
 monotonic. (§12, G8)
+
+**And the count must scan, not filter.** Getting this wrong is not a missed
+optimisation: on an event-based gateway the persist gate evaluates `False` while
+the handler's domain write has already committed, so the sweep re-runs the
+handler every 60 seconds forever (§12, G8 and G23).
 
 **Every instance is processed in its own try/except with a `db.rollback()` on
 failure.** One poisoned workflow must not stop the sweep for everything else —
@@ -728,6 +800,15 @@ svc_do_thing → gw_outcome ├── thing_retry_pending and thing_attempt < th
 even the irrelevant ones.** A gateway condition referencing a flag that the
 taken branch never set raises `NameError` inside Spiff's evaluator and takes
 down the transition. Exhaustive flags are the cheap fix. (§12, G9)
+
+**They are not quite exhaustive enough, and the gateway above hides it.**
+`terminal_failure` sets neither `<op>_attempt` nor `<op>_max_attempts`, which
+the retry condition references. It survives only because Python's `and`
+short-circuits on `<op>_retry_pending == False` before reaching them — so
+reordering that condition, or adding a branch that reads `_attempt` first,
+turns a permanent failure into a `NameError`. Either have `terminal_failure`
+set the counters too, or treat the short-circuit as load-bearing and comment it
+as such. Do not leave it accidental.
 
 Distinguish transient (retry) from permanent (route to failure) at the
 **handler**, not the gateway. A declined card is not a network blip.
@@ -924,10 +1005,27 @@ external system that might never respond.
 </bpmn:intermediateCatchEvent>
 ```
 
+**Every end event in this process must terminate.** This is not optional
+decoration — omit it and the shape produces the exact zombie it exists to
+prevent:
+
+```xml
+<bpmn:endEvent id="end_canceled" name="Order canceled">
+  <bpmn:incoming>sf_released</bpmn:incoming>
+  <bpmn:terminateEventDefinition/>      <!-- REQUIRED. See §12 G23. -->
+</bpmn:endEvent>
+```
+
+Without it the losing arms stay `MAYBE`, the gateway stays `WAITING`, `EndJoin`
+never resolves, and the instance never leaves `running` — while the timeout
+handler re-runs every 60 seconds forever. Full mechanism and measurements in
+G23; it is the most expensive gotcha in this document.
+
 The real-world stake, from the comment in the file: without the timeout branch,
 an abandoned Stripe Checkout leaves the workflow zombied at `await_payment`
 **and inventory committed indefinitely** — phantom oversells. A single-catch
-"wait for payment" is almost always a bug.
+"wait for payment" is almost always a bug. (And a timeout branch *without*
+terminate strands it just as thoroughly, one layer deeper.)
 
 #### 6.4.4 Shape D — parent/child orchestration with a join
 
@@ -1234,6 +1332,15 @@ business key (rather than instance id) keeps the ops UI admin-only while
 letting any product page render a state badge, a history timeline, and
 transition buttons.
 
+> **⚠ Authorize `by-key` against the underlying object.** As shipped in the
+> reference implementation it requires only *authentication*: any logged-in user
+> who can guess a business key — `blog_post:<id>`, `order:<id>` — reads that
+> object's full transition history, including `actor_user_id`, `reason` and
+> `metadata`. Business keys are enumerable by construction, so this is a
+> horizontal-access hole, not a theoretical one. The fix is a per-object-type
+> ownership check before returning history; `available_actions` already scopes
+> by role, but the read path does not.
+
 `cancel` sets `status='canceled'`, marks every `ready` task `canceled`, and
 writes a `canceled` audit row **with a mandatory reason**. It does not step the
 workflow — a canceled instance is frozen for inspection.
@@ -1393,14 +1500,25 @@ likely to be wrong: the graph.
 
 ```python
 class _RecordingEngine(PythonScriptEngine):
-    def __init__(self): super().__init__(); self.calls = []
+    def __init__(self, results=None):
+        super().__init__(); self.calls = []; self._results = results or {}
     def execute(self, task, script, external_context=None):
-        calls = self.calls
+        calls, results = self.calls, self._results
         def _dispatch(name):
-            calls.append(name); return {"dispatched": name}
+            calls.append(name)
+            out = results.get(name, {"dispatched": name})
+            if isinstance(out, dict):
+                task.data.update(out)      # mirror the real engine — see below
+            return out
         ext = dict(external_context or {}); ext["_dispatch"] = _dispatch
         return super().execute(task, script, ext)
 ```
+
+**The harness must merge handler results into `task.data`, exactly as the real
+`_dispatch` does (§5.2).** Omit that and no gateway downstream of a service task
+can see the flag it branches on, so the test can't reach — let alone assert —
+any branch that depends on a handler's return value. Passing a `results` map
+also lets one test drive each branch by stubbing what a handler returns.
 
 Assert: which handlers fired, in what order; that each gateway branch is
 reachable; that every path terminates. **One test module per process** — 26 of
@@ -1574,23 +1692,63 @@ parsing and graft the values onto each user-task spec. Also: `camunda:assignee`
 holds the **name of a workflow variable**, not a value and not a template —
 keep it a bare name, no `${...}`.
 
-**G6. Signals need a `BpmnEvent` wrapper in 3.x.** `workflow.signal(name)` and
-`workflow.catch(SignalEventDefinition(name))` are 1.x/2.x. Use
-`workflow.send_event(BpmnEvent(SignalEventDefinition(name)))`.
+**G6. Signals need a `BpmnEvent` wrapper in 3.x.** `workflow.signal(name)` is
+1.x/2.x and is gone. `workflow.catch(...)` **does still exist** in 3.1.2 and is
+not deprecated — only its argument type changed, from a bare event definition to
+a `BpmnEvent`. The two are not interchangeable: `catch` **queues** an event that
+nothing is currently waiting on, while `send_event` **raises** if no task
+consumes it. Prefer `send_event`, so that signalling a workflow that isn't
+listening surfaces instead of vanishing — which is why every `signal_parent_*`
+helper wraps it in a `try/except` (§6.4.4).
 
-**G7. A token looping back through a *signal* catch event terminates the
-workflow.** (Historically "Gotcha #17".) You therefore cannot model "any state →
-any state, repeatedly" as a receive-loop. The proven pattern is Shape B
-(§6.4.2): the workflow is a durable anchor parked at a catch state that advances
-only on **forward/terminal** signals, and arbitrary/repeated transitions are
-`state_transitions` ledger rows. **Nuance:** *timer* loop-backs are fine and run
-in production (§6.4.5); it is signal catch events, and cancellable
-parallel-branch loops, that break.
+```python
+workflow.send_event(BpmnEvent(SignalEventDefinition(name)))   # raises if unconsumed
+workflow.catch(BpmnEvent(SignalEventDefinition(name)))        # queues silently
+```
 
-**G8. Loop-back timers defeat name-based progress snapshots.** A poll loop ends
-each iteration at the same `task_spec.name`, so a before/after diff keyed on
-names sees nothing and never persists — the loop silently never advances. Use a
-monotonic metric: count tasks in `COMPLETED` state before and after.
+**G7. Do not loop a token back through a *signal* catch event.** (Historically
+"Gotcha #17".) The rule stands; the mechanism is not what it was long recorded
+as. **It does not "terminate the workflow."** Measured against 3.1.2:
+
+| Loop shape | What actually happens |
+|---|---|
+| Bare cycle, no gateway | `RecursionError` inside `BpmnWorkflow.__init__` — at *construction*, before any signal is sent |
+| Cycle through an exclusive gateway | Runs. Never terminates. But each iteration leaks **~6 permanent `Task` objects and ~2.2 KB of `serialized_state`** — 7.0 KB → 28.6 KB at 10 iterations → 50.3 KB at 20, linear and forever |
+| Re-entered catch event's task data | Predicted loop copies are created with **empty data**, so the gateway condition that gates the loop `NameError`s (G9) and the task lands in `ERROR` |
+
+Unbounded growth of the column deserialized on *every* 60-second tick is the
+real argument, and it is a much stronger one than "it terminates." Model
+repeated/arbitrary transitions as Shape B (§6.4.2): a durable anchor parked at a
+catch state, advancing only on **forward/terminal** signals, with everything
+else as `state_transitions` ledger rows.
+
+**Nuance:** *timer* loop-backs are fine and run in production (§6.4.5) — the
+poll loop is bounded by its own exit gateway and each iteration's data is
+re-established by the service task. It is signal catch events and cancellable
+parallel-branch loops that break.
+
+**G8. A name-keyed progress snapshot misses a loop — and the obvious fix has its
+own blind spot.** A poll loop ends each iteration at the same `task_spec.name`,
+so a before/after diff keyed on names sees no change and never persists
+(verified: names identical every iteration while completed-count went
+4→7→10→13→18). Use a monotonic count of `COMPLETED` tasks.
+
+**But do not compute that count with `get_tasks(state=TaskState.COMPLETED)`.**
+Spiff's `TaskIterator` sets `min_state` and stops descending at the first
+ancestor that doesn't meet it, so **any WAITING node hides every completed task
+beneath it**. On an event-based gateway the gateway itself stays WAITING, so the
+filtered count reports no progress at all (measured: filtered 3→3 while the true
+count went 3→6). Scan every task and filter in Python:
+
+```python
+# WRONG — a WAITING ancestor hides everything below it
+sum(1 for _ in workflow.get_tasks(state=TaskState.COMPLETED))
+
+# RIGHT
+sum(1 for t in workflow.get_tasks() if t.state == TaskState.COMPLETED)
+```
+
+Getting this wrong costs more than a missed persist: see G23.
 
 **G9. Gateway conditions `NameError` on unset variables.** An unset name is not
 falsy — it is an exception that kills the transition. Every branch of a service
@@ -1672,6 +1830,65 @@ nothing listening).
 **G22. Always set `default=` on exclusive gateways, pointing at the safe
 branch.** No matching condition and no default is a runtime exception. And the
 safe branch is "escalate to a human", not "proceed".
+
+**G23. Every end event of a process containing an `eventBasedGateway` MUST carry
+`<bpmn:terminateEventDefinition/>`.** This is the most expensive gotcha in this
+document, because two defects compound into the exact incident G14 describes,
+and the shape it strands is the one that exists to prevent stranding (§6.4.3).
+
+Without terminate, the losing race arms stay `MAYBE` and the gateway stays
+`WAITING`, so `EndJoin` never resolves and the instance never leaves `running`.
+On the **timer** arm — the abandonment path — it gets worse: an event-based
+gateway's `has_fired` is driven by `seen_events`, which only signals populate, so
+a timer never resolves the gateway at all.
+
+Measured on a real order workflow, timer shortened to 1s:
+
+```
+BEFORE   handler fired: svc_release_and_cancel     ← domain write COMMITS
+         is_completed(): False                      persist gate: False
+         stuck: gw_await_payment, EndJoin, evt_payment_captured, … (8 tasks)
+
+AFTER    handler fired: svc_release_and_cancel
+         is_completed(): True                       persist gate: True
+         stuck: []
+```
+
+The persist gate is `False`, so the workflow state is **discarded** while the
+handler's domain write **commits**. Next tick the instance deserializes to its
+pre-timeout state, the timer is still due, and the handler runs again. Every 60
+seconds. Forever. That is a split-brain against Law 4 *and* G14's runaway sweep,
+from one missing XML element.
+
+Two further consequences worth knowing:
+
+- **Terminate also un-blinds the progress metric.** Cancelling the WAITING
+  gateway lets the task iterator descend, so even the naive filtered count in G8
+  starts reporting correctly. Fix both anyway — they fail independently.
+- **Existing instances do not get the fix.** Running instances stay pinned to
+  their deployed definition version (§11.3), so anything already stranded stays
+  stranded and keeps re-running its handler. After deploying a terminate fix,
+  audit `process_instances WHERE status='running'` with an old `updated_at` and
+  cancel the strays by hand.
+
+Guard it statically — the rule is mechanical, so a test can enforce it across
+every definition rather than trusting review:
+
+```python
+for path in all_bpmn():
+    root = ET.fromstring(path.read_text())
+    if root.find(f".//{{{BPMN_NS}}}eventBasedGateway") is None:
+        continue
+    for end in root.iter(f"{{{BPMN_NS}}}endEvent"):
+        assert end.find(f"{{{BPMN_NS}}}terminateEventDefinition") is not None
+```
+
+> **On the XML parser.** Stdlib `ElementTree` is fine for definitions that live
+> in your own repo — version-controlled, authored by you, never user-supplied.
+> **If your product ever lets users upload `.bpmn` files**, that stops being
+> true: switch every parse path (the loader in §5.4 included) to
+> `defusedxml.ElementTree`, or you have handed them XXE and entity-expansion
+> against the process that runs your workflows.
 
 ---
 
@@ -1783,6 +2000,36 @@ should make deliberately rather than inherit:
 - **One core module imports from a site package**, violating the
   core-never-imports-a-site rule (§8). Latent, because no other site mounts it —
   which is exactly how this class of leak survives.
+- **`by-key` history is authenticated but not authorized** — see the warning in
+  §7.6. Business keys are enumerable.
+- **`business_key` shipped as `VARCHAR(100)`** (§4.1 now says 255). Widening it
+  needs a migration in **every** tenant's chain, not just one.
+- **Index names collide across tables** (`idx_object`, `idx_instance`). Fine on
+  MySQL, blocks a PostgreSQL or SQLite port.
+- **`workflow_tasks` cannot identify *which* Spiff task a row projects.**
+  `task_spec_name` is the only link, which stops being unique the moment a user
+  task sits inside a loop or a parallel branch.
+
+### 14.4 Found by an unbriefed review, 2026-08-06
+
+Two independent reviewers — neither briefed by the author, both forbidden from
+reading the implementation — worked from this document alone: one rebuilt the
+engine from it, one audited it cold. Between them they found five defects that
+were live in the reference implementation, **every one of which fails silently**:
+
+| Defect | Impact |
+|---|---|
+| No `terminateEventDefinition` on any racing process | Every timed-out instance stranded in `running`, handler re-run every 60s forever (G23) |
+| Progress metric used the filtered iterator | Sweep discarded real progress behind any WAITING node (G8) |
+| `_catchable_signals` read `event_definitions` | `available_actions()` never returned a signal, for any workflow, ever |
+| `candidateGroups` kept only the first entry | Multi-group tasks invisible to every role but the first-listed |
+| `data_objects.update(seed)` | Dead line with a comment asserting the opposite (§5.3) |
+
+All five are corrected in the text above. The lesson generalises past BPM:
+**a briefed reviewer inherits the briefer's blind spots.** Every one of these
+had survived normal review, a passing test suite, and months in production —
+because none of them raises. Run one unbriefed pass on anything load-bearing,
+and make it build the thing rather than read about it.
 
 ---
 
