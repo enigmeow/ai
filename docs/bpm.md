@@ -54,7 +54,10 @@ An unbriefed reviewer rebuilt the engine from it and shipped a working system
 with 67 passing tests, but had to supply the HTTP/auth layer, the user and role
 model, and one schema column of their own (§5). Expect to write real code from
 these shapes; expect §12 to save you weeks. §14.4 lists what that exercise
-found — five silent defects, all now corrected in the text.
+found — five silent defects. A later pass caught that two of those corrections
+had reached one section and not another, leaving this document contradicting
+itself; §14.6 records that, because it is the most likely way a hazard list
+rots.
 
 The spec is stack-flavored (Python / FastAPI / SQLAlchemy / MySQL /
 SpiffWorkflow) but the design is portable. The parts that generalize are §1
@@ -672,10 +675,43 @@ a SQL `IN`. `camunda:assignee` holds the **name of a workflow variable**
 (e.g. `owner_user_id`) which is resolved against task/workflow data → 
 `assignee_user_id`. Keep it a bare variable name — no Jinja/`${}` interpolation.
 
-**Error handling.** If `do_engine_steps()` raises, the instance is flipped to
-`status='error'`, an `error` audit row records the exception text, and the
-exception re-raises so the request fails loudly. The instance is left where it
-died for inspection.
+**Error handling — and the durability trap in it.** If `do_engine_steps()`
+raises, the instance is flipped to `status='error'`, an `error` audit row
+records the exception text, and the exception re-raises so the request fails
+loudly. The instance is left where it died for inspection.
+
+**Those two goals are in direct conflict, and the naive implementation loses
+the first.** The status flip and the audit row are writes on the caller's
+session; re-raising means the caller never commits, so both are rolled back.
+The instance is *not* left in `error` — it is left exactly as it was, with no
+record that anything failed. Three consequences:
+
+- §11.5's headline monitoring signal (`status='error'`) is never durably written
+  for router-driven failures, so the thing you alert on does not exist.
+- **G25's precondition never exists either** — an instance can only go
+  permanently deaf if something actually persisted `error`.
+- Worst case: if the step failed on a *database* error (G16's overflow is the
+  canonical one), the session is already poisoned, so `audit.record`'s flush
+  raises too — and that second exception **masks the original**, which is the
+  one you needed.
+
+Where the error state *does* persist, it is usually by accident: a caller that
+catches the exception and commits anyway. Webhook handlers do exactly that
+(§7.2 rule 4), which is why errored instances show up from webhook-driven
+transitions and not from router-driven ones. Inconsistent by construction.
+
+If you want the error durable — and you do, or G25 and §11.5 are fiction —
+**write it on a separate, short-lived session** that commits independently of
+the caller's transaction:
+
+```python
+except Exception as e:
+    _record_error_out_of_band(instance.id, e)   # own session, own commit
+    raise                                       # caller still fails loudly
+```
+
+That is the one place in this design where a second session is justified. Do not
+reach for it anywhere else.
 
 ### 5.4 `loader.py` — deploying `.bpmn` files
 
@@ -1263,6 +1299,26 @@ Four rules, each learned the expensive way:
    endpoint. The domain row update and the signal are separate concerns; do the
    row update inline and treat the signal as best-effort.
 
+> **⚠ Rules 4 and G10/G26 collide, and obeying both naively breaks the
+> workflow.** Rule 4 says update the domain row inline, before signalling.
+> G10/G26 say a handler must guard on the object's *current* state. Put those
+> together with the obvious column and the inline update sets the very state the
+> handler guards on — so the handler short-circuits on its **first** run and
+> skips its own side effects. The row says `canceled`; the inventory was never
+> released. That is the phantom oversell §6.4.3 exists to prevent, reached by
+> following two individually correct rules.
+>
+> Resolve it deliberately, one of:
+> - **Guard on a different fact than the one you set inline.** Guard on "money
+>   or goods moved" (`payment_status`, `fulfillment_status`), never on the
+>   lifecycle column the webhook just wrote.
+> - **Don't set the lifecycle column inline** — let the handler own it, and keep
+>   the inline update to provider-side facts (intent ids, card metadata).
+>
+> The second is cleaner and matches Law 1. The first is what you do when a
+> pre-workflow code path already writes that column and you cannot remove it
+> yet.
+
 The response body reports `{"signaled": [...]}` — invaluable when debugging
 "did that event actually do anything?"
 
@@ -1327,8 +1383,10 @@ Visibility is a single predicate used by every endpoint:
 
 ```python
 def _visible_to(task, user) -> bool:
+    # assignee_role is a comma-separated candidate LIST ("admin,senior_instructor"),
+    # so has_role() on the raw column is False for every multi-group task (G24).
     return (task.assignee_user_id == user.id
-            or (task.assignee_role and user.has_role(task.assignee_role)))
+            or user_matches_role(task.assignee_role, user))
 ```
 
 Claim rules: must be `ready` (else 409), role must match (403), and a task
@@ -1370,9 +1428,29 @@ workflow — a canceled instance is frozen for inspection.
 
 **`retry_failed_task` is currently unimplemented** (`NotImplementedError`; the
 endpoint returns 501). Honest gap, called out here so nobody assumes coverage.
-Today recovery is: fix the handler, deploy, and let the 60s tick re-drive the
-instance — which works because handlers are written idempotent, and which is
-*why* they must be.
+
+**And the usual answer — "fix the handler, deploy, let the 60s tick re-drive
+it" — only covers half the failures.** The tick re-drives *timers*: it calls
+`refresh_waiting_tasks()`, so an instance waiting on a due timer gets another
+go. That is genuinely why handlers must be idempotent.
+
+**A signal-driven failure is not recoverable this way at all.** The signal was
+delivered once, consumed in memory, and is durable nowhere — there is no queue,
+no outbox, and the payload lives only in the `state_transitions` metadata as an
+audit record, not as something the engine can replay. Fix the handler, deploy,
+and the tick will re-drive nothing, because nothing is waiting on a timer.
+
+This matters more than it looks: **G25's incident is precisely a signal-driven
+failure.** The section documenting the incident and the section documenting the
+recovery describe mechanisms that do not connect. Until `retry_failed_task`
+exists, a signal-driven error is unrecoverable except by hand — re-sending the
+signal from an admin tool, or editing serialized state. Plan for one of:
+
+1. Implement `retry_failed_task` (re-drive from the persisted state).
+2. Persist the half-stepped workflow on error, so there is something to retry
+   from — a real design decision, and one this document does not otherwise make.
+3. Give signals an outbox, so delivery can be replayed. Heaviest, and only worth
+   it if signals carry payloads you cannot reconstruct.
 
 ### 7.7 Agent / MCP surface
 
@@ -1558,8 +1636,14 @@ copying verbatim:
 
 Two shipped bugs were caught by nothing:
 
-- A handler wrote `Order.canceled_at`, a column that existed on neither the
-  model nor the table → `AttributeError` every tick, forever.
+- A handler touched `Order.canceled_at`, an attribute that existed on neither
+  the model nor the table → `AttributeError` every tick, forever. **Precisely:
+  the handler did `if order.canceled_at is None: order.canceled_at = _now()`,
+  and it was the READ that raised.** Assigning an undeclared attribute to a
+  SQLAlchemy instance is silent — it just sets a plain Python attribute that is
+  never persisted, which is its own quiet bug. Only reading one raises. If your
+  handler assigns without reading first, you get no error and no column write:
+  strictly worse, because nothing tells you.
 - A composite `object_id` (73 chars) into `varchar(36)` → `DataError 1406`
   every tick, poisoning the session.
 
@@ -1701,13 +1785,26 @@ registers on import. `main.py` must import every handler package at startup, and
 otherwise `RuntimeError: no Python handler registered for service task '…'` the
 first time that task runs.
 
-**G4. Workflow data must be seeded in three places.** Spiff evaluates
-expressions as `evaluate(expr, task.data, external_context=workflow.data_objects)`.
-`workflow.data` alone is *not* consulted. Seed `workflow.data`,
-`workflow.data_objects`, **and** the root start task's `data` (which propagates
-by inheritance). For signal payloads, also update every waiting/ready task's
-local data — the condition evaluates against the task about to fire. Symptom:
-a gateway condition that "can't see" a variable you know you set.
+**G4. Seed the START TASK's data, not just `workflow.data`.** Spiff evaluates
+expressions as `evaluate(expr, task.data, external_context=workflow.data_objects)`,
+and `workflow.data` alone is *not* consulted. Seed `workflow.data` (for Spiff's
+own lookups and your ctx merge) **and the root start task's `data`, which is the
+write that actually makes gateway conditions resolve** — it propagates to
+children by task inheritance. For signal payloads, also update every
+waiting/ready task's local data: the condition evaluates against the task about
+to fire, not the workflow root. Symptom: a gateway condition that "can't see" a
+variable you know you set.
+
+**Do not seed `workflow.data_objects`.** It is the obvious third place and it
+does nothing — a read-only property returning `self.data.get('data_objects', {})`,
+so with no such key it hands back a fresh dict per access and your update is
+discarded. Real BPMN data objects need a `<bpmn:dataObject>` declaration. Full
+detail in §5.3.
+
+> Earlier versions of this document told you to seed it here. That instruction
+> was wrong and is the kind of error to expect in a hazard list: the fix landed
+> in §5.3 and this entry was missed, so the document contradicted itself for a
+> while — with the wrong copy in the section §0 tells you to read first.
 
 **G5. Spiff does not parse the `camunda:` namespace.** `camunda:candidateGroups`
 and `camunda:assignee` arrive as `extensions = {}`. Walk the XML with lxml after
@@ -1814,6 +1911,20 @@ terminal state, so **their committed inventory stayed reserved indefinitely**.
 Alert on tick error rate; give the sweep a give-up path; treat "stuck instance"
 as a first-class monitored state.
 
+Concretely, because "give it a give-up path" is not actionable on its own:
+
+- **Count consecutive failures per instance** — a `tick_failures` column on
+  `process_instances`, incremented in the sweep's `except`, reset to 0 on any
+  successful advance.
+- **Stop sweeping at a threshold** (5 is generous — a transient DB blip clears
+  in one tick). Set `status='error'` and leave it; the instance is then visible
+  to §11.5's monitoring rather than burning a tick forever.
+- **Alert on the transition, not the depth** — one alert when an instance gives
+  up, not one per tick, or you have rebuilt the log spam in your pager.
+
+Without a stored counter the sweep has no memory between ticks, which is exactly
+why the original ran forever.
+
 **G15. A single-catch wait is usually a zombie waiting to happen.** Any state
 that waits on an external system needs an event-based gateway with at least a
 timeout branch (§6.4.3). Without it, an abandoned checkout parks the workflow
@@ -1854,6 +1965,12 @@ nothing listening).
 branch.** No matching condition and no default is a runtime exception. And the
 safe branch is "escalate to a human", not "proceed".
 
+**`default=` does not save you from G9.** It is taken when every condition
+evaluates to *False* — not when one *raises*. An unset variable is a `NameError`
+inside the evaluator, which propagates and kills the transition before any
+default is considered. The two hazards need separate fixes: `default=` for the
+no-match case, exhaustive flags for the unset-name case.
+
 **G23. Every end event of a process containing an `eventBasedGateway` MUST carry
 `<bpmn:terminateEventDefinition/>`.** This is the most expensive gotcha in this
 document, because two defects compound into the exact incident G14 describes,
@@ -1880,14 +1997,28 @@ AFTER    handler fired: svc_release_and_cancel
 The persist gate is `False`, so the workflow state is **discarded** while the
 handler's domain write **commits**. Next tick the instance deserializes to its
 pre-timeout state, the timer is still due, and the handler runs again. Every 60
-seconds. Forever. That is a split-brain against Law 4 *and* G14's runaway sweep,
-from one missing XML element.
+seconds. Forever. That is a split-brain against Law 4 *and* G14's runaway sweep.
 
-Two further consequences worth knowing:
+**Be precise about which defect causes which symptom — they compose, and fixing
+one alone changes the failure rather than removing it:**
+
+| State of the two bugs | What you get |
+|---|---|
+| Missing terminate **+** filtered progress metric (G8) | The 60s runaway above. Loud: a handler re-running forever |
+| Missing terminate, metric **fixed** | The advance persists once, so the handler runs **once** — but the gateway still never resolves, so the instance is a permanent `running` zombie. **Silent**, and still holding whatever it reserved |
+| Terminate present, metric broken | The instance terminates, but other shapes with a WAITING ancestor still lose progress |
+
+So the runaway needs *both*. Fixing only G8 downgrades a noisy runaway into a
+**quiet** zombie, which is worse for detection — and a quiet zombie is exactly
+what nobody notices for three months. Fix both.
+
+One further consequence worth knowing:
 
 - **Terminate also un-blinds the progress metric.** Cancelling the WAITING
   gateway lets the task iterator descend, so even the naive filtered count in G8
-  starts reporting correctly. Fix both anyway — they fail independently.
+  starts reporting correctly on *this* shape. That is a side effect, not a fix:
+  G8 still bites any other shape that parks a WAITING ancestor above completed
+  work.
 - **Existing instances do not get the fix.** Running instances stay pinned to
   their deployed definition version (§11.3), so anything already stranded stays
   stranded and keeps re-running its handler. After deploying a terminate fix,
@@ -2127,6 +2258,12 @@ were live in the reference implementation, **every one of which fails silently**
 | `candidateGroups` kept only the first entry | Multi-group tasks invisible to every role but the first-listed |
 | `data_objects.update(seed)` | Dead line with a comment asserting the opposite (§5.3) |
 
+The lesson generalises past BPM: **a briefed reviewer inherits the briefer's
+blind spots.** Every one of these had survived normal review, a passing test
+suite, and months in production — because none of them raises. Run one unbriefed
+pass on anything load-bearing, and make it build the thing rather than read
+about it.
+
 ### 14.5 Found by *implementing* those fixes
 
 The review found what was wrong with the document. Applying the fixes to the
@@ -2143,11 +2280,46 @@ reviewer **build** rather than read:
 None of these is visible from the document alone. They only appear when the
 fixes meet real data.
 
-All five are corrected in the text above. The lesson generalises past BPM:
-**a briefed reviewer inherits the briefer's blind spots.** Every one of these
-had survived normal review, a passing test suite, and months in production —
-because none of them raises. Run one unbriefed pass on anything load-bearing,
-and make it build the thing rather than read about it.
+### 14.6 Found by a SECOND unbriefed build, from the corrected text
+
+The corrections were then re-tested the same way: a fresh unbriefed agent built
+the engine again from the revised document. The hazards largely worked — G23's
+measurement table reproduced exactly, G8 reproduced with these very integers, and
+G16 caught a `String(36)` already typed. What it found instead was subtler and
+worth more than the first round:
+
+**Two corrections had reached one section and not another**, leaving the
+document contradicting itself:
+
+| Fixed in | Still wrong in |
+|---|---|
+| §5.3 (`data_objects` is a no-op) | **G4**, which still told you to seed it — in the very section §0 sends you to first |
+| G24 (`candidateGroups` is a list) | **§7.5's `_visible_to` snippet**, still `has_role(csv_column)` — the exact bug, printed as reference code four sections earlier |
+
+**This is the characteristic failure of a hazard list**: a rule is stated in
+several places, someone corrects the instance in front of them, and the stale
+copies keep teaching the bug. It is worse than never having documented the rule,
+because the reader has no way to know which copy is current. When you correct
+anything in §12, grep the whole document for every other statement of the same
+rule before you commit.
+
+Two blocking gaps it found by building rather than reading:
+
+- **The error path is not durable** — flipping `status='error'` and re-raising
+  cannot both work on one session (§5.3). §11.5's monitoring signal and G25's
+  precondition therefore never exist for router-driven failures.
+- **"Let the tick re-drive it" does not recover a signal-driven failure**
+  (§7.6) — and G25's own incident is signal-driven.
+
+And one collision the document *creates*: §7.2 rule 4 versus G10/G26 (see the
+warning in §7.2). Following two correct rules naively produces the phantom
+oversell §6.4.3 exists to prevent.
+
+Also corrected from that pass: G23's headline overstated the runaway (it needs
+G8 too — fixing G8 alone yields a *silent* zombie, which is worse to detect);
+G22 implied a protection against G9 that `default=` does not provide; G14 named
+a hazard with no actionable remedy; and §10.2's `canceled_at` anecdote blamed
+the write when it was the read that raised.
 
 ---
 
