@@ -46,12 +46,16 @@
 
 ### 1.1 The four parties
 
-| Party | Sees | Never sees |
-|---|---|---|
-| **Management** | Everything. Accepts intake, creates projects, approves expenses, edits budgets, assigns roles, approves public content, manages the contractor registry | — |
-| **Team member** | Projects they are assigned to: tasks, hours, expenses, client + contractor messaging | Projects they are not on |
-| **Client** | Their project: tasks, messages, contracts, invoices, budget summary | Internal notes, contractor rates, team-only threads, other clients |
-| **Contractor / vendor** | Their own contracts, a stripped project timeline, one team-only thread | The budget, the client's identity, other contractors, internal notes |
+| Party | Sees | Money it sees | Never sees |
+|---|---|---|---|
+| **Management** | Everything. Accepts intake, creates projects, approves expenses, edits budgets, assigns roles, approves public content, manages the contractor registry | All of it, including revenue | — |
+| **Team member** | Projects they are assigned to: tasks, hours, expenses, client + contractor messaging | Project costs | Projects they are not on |
+| **Client** | Their project: tasks, messages, contracts, invoices, budget summary | Budget, spend-on-their-behalf, the fee, what they've been invoiced and paid | Internal notes, team-only threads, other clients |
+| **Contractor / vendor** | Their own contracts, a stripped project timeline, one team-only thread | **Their own contract value and invoices — nothing else** | The budget, the fee, the client's identity, other contractors, internal notes |
+
+The money column is not decoration: it is the axis that most often gets designed
+by accident. What each party may see depends on the revenue model, so settle
+that before the schema — §5.0.
 
 The client party splits again: exactly one **financial contact** per project may
 see and act on money; every other client contact is **standard**. That
@@ -245,7 +249,8 @@ right, because humans log "1.25 hours".
 projects
   id, name, location, project_type, status, deadline
   client_overview          TEXT   -- team-written, shown to the client
-  budget_total_cents       BIGINT
+  budget_total_cents       BIGINT   -- money that flows THROUGH to vendors
+  management_fee_cents     BIGINT   -- revenue, charged ON TOP (§5.0)
   committed_cents          BIGINT
   spent_cents              BIGINT
   pm_user_id               -> users
@@ -360,6 +365,9 @@ coupling them means every e-commerce change risks the invoicing path. Reuse the
 ```
 contracts
   project_id, title, file_url?, docusign_url?, vendor_id?,
+  value_cents?             -- NULLABLE: many contracts have no headline number
+                           -- (NDAs, scopes priced per invoice) and 0 would lie.
+                           -- The one money field a vendor may see, own only.
   status ∈ (pending, signed)
 contract_comments
   contract_id, author_user_id, body
@@ -568,22 +576,26 @@ class VendorTimelineTask(BaseModel):
 It cannot leak, because there is nothing in it to leak. No assignee, no cost, no
 client note, no vendor linkage to other contractors.
 
-> **⚠ The client projection in the reference implementation does not do this,
-> and it leaks.** The task-list endpoint is gated on *any* active membership and
-> returns the full team schema — including `expected_cost_cents`,
-> `actual_cost_cents`, `deposit_cents`, `paid_in_full` and `vendor_id`. So a
-> `client_standard` contact, whom §2 explicitly says must not see money, reads
-> per-task costs and contractor links.
+> **⚠ The client projection in the reference implementation does not do this.**
+> The task-list endpoint is gated on *any* active membership and returns the
+> full team schema — `expected_cost_cents`, `actual_cost_cents`,
+> `deposit_cents`, `paid_in_full`, `vendor_id`. A `client_standard` contact
+> therefore reads per-task costs and contractor links.
 >
-> This is the §2.2 principle failing exactly where it was not applied. The
-> contractor path got a narrow schema and is safe by construction; the client
-> path reuses the team's schema and leaks by default. **Same codebase, two
-> approaches, one of them correct.**
+> Whether that is a **bug** depends on the revenue model (§5.0), and that is the
+> lesson. Under markup it is a margin leak. Under pass-through plus a flat fee —
+> which is what that business actually runs — it is the receipt, and defensible.
+> Either way the code was not *deciding*; it reused the schema that already
+> existed and answered the question by accident.
 >
-> The fix is a per-audience schema, not a conditional field:
-> `client_standard` gets a projection without the money fields, chosen by
-> `user_project_role()` at serialization. Conditionally blanking fields on a
-> shared schema is the exclusion-list pattern again, and it fails the same way.
+> The contractor path shows the contrast: a purpose-built narrow schema, safe by
+> construction, because someone sat down and chose the three fields. **Same
+> codebase, two approaches — one deliberate, one inherited.**
+>
+> The fix is a per-audience schema chosen by `user_project_role()` at
+> serialization, not conditional field-blanking on a shared one — blanking is
+> the exclusion-list pattern again and fails the same way. What goes *in* the
+> client projection is a business decision, and §5.0 is where you make it.
 
 **The rule this yields: a trust boundary needs its own schema, not a shared
 schema with fields omitted at runtime.** If two audiences can read an endpoint,
@@ -646,7 +658,45 @@ support queues, manufacturing — invert most of these.
 
 ---
 
-## 5. The money model — four totals, four questions
+## 5. The money model
+
+### 5.0 Decide the revenue model before you design any of this
+
+This section originally opened with the four totals below, as though one money
+vocabulary were enough. It isn't, and getting that wrong is expensive to undo,
+so decide this first:
+
+**Every figure in §5.1 is a *cost* — money flowing out to the people doing the
+work. None of them is a *price*.** A services business also has revenue, and
+where that revenue comes from decides who may see what:
+
+| Revenue model | Consequence for the money views |
+|---|---|
+| **Markup on vendor costs** | Cost is commercially sensitive. A client who can see both budget and distributed can compute your margin. Client and vendor need genuinely different numbers per line of work, which means a **price axis** on the task alongside the cost axis. |
+| **Flat fee on top** (pass-through costs) | Cost is *not* sensitive — showing the client what was spent on their behalf is the receipt, and exactly what a pass-through client should see. You need one fee field, not a price axis. |
+| **Fee taken out of the budget** | The budget stops meaning one thing, and "remaining" silently mixes vendor money with your margin. Avoid unless a client contract forces it. |
+
+The reference implementation chose **flat fee on top**:
+
+```
+Project.budget_total_cents      money that flows THROUGH us to vendors
+Project.management_fee_cents    our revenue — charged ON TOP, never a slice
+client_total = budget + fee     derived, never stored
+```
+
+Keeping the fee *out* of the budget is what lets `remaining` keep answering a
+single honest question — *"how much of the build budget is left?"* — and makes
+the fee a visible line rather than an invisible deduction.
+
+**The failure this avoids.** Before the fee existed, that codebase had no price
+concept at all: every field was `*_cost_cents`, and the client dashboard
+rendered *Distributed Total* — money already paid out to vendors — to any
+project member. Under a markup model that would have put the margin on the
+client's own screen. It was survivable only because the intended model turned
+out to be pass-through. **The visibility rules cannot be designed until the
+revenue model is settled**, which is why this now comes first.
+
+### 5.1 Four totals, four questions
 
 The most-copied mistake in project software is a single `spent` number. Four
 different people ask four different questions and each needs a different answer:
@@ -675,7 +725,32 @@ Note the deliberate asymmetries:
   computed on read. One writer, many readers.
 
 `committed_cents` exists in the schema for contracted-but-unbilled work and is
-not yet wired — an honest gap, noted so nobody assumes it is populated.
+not yet wired — an honest gap, noted so nobody assumes it is populated. Giving
+`Contract` a `value_cents` is what makes it computable; without a contract
+value there is nothing to commit.
+
+### 5.2 The three money views
+
+Same data, three audiences. **Derived per audience, not one view with fields
+blanked at runtime** — blanking is the exclusion-list pattern from §2.2 and
+fails the same way (§12 G13).
+
+| Party | Sees |
+|---|---|
+| **Staff** | Everything: all four totals, the fee, and fee-accrued vs fee-invoiced |
+| **Client** | Budget · spent on your behalf · remaining · **fee** · **client total** · invoiced · paid |
+| **Vendor** | **Their own contract value and their own invoices.** Nothing about the project budget, the client, the fee, or any other vendor |
+
+The vendor row is easy to get wrong in *both* directions. The reference
+implementation initially showed vendors **no money at all** — not even their own
+contracted amount, because `Contract` carried no value field. That is as wrong as
+over-sharing: a contractor cannot see the number they signed up to. The fix was
+one nullable `value_cents` on `Contract`, surfaced through the vendor's own
+narrow schema.
+
+**Nullable, not zero-defaulted.** Plenty of contracts are documents with no
+headline number — NDAs, scopes priced per invoice — and `0` would be a lie about
+those. Absent must stay distinguishable from zero.
 
 ---
 
@@ -1049,13 +1124,25 @@ values need different escapes. Interpolating into `title="…"` with an
 element-text escaper is a stored-XSS hole. Use distinct helpers (`esc` /
 `escAttr` / `safeUrl`) and lint for attribute interpolation.
 
-**G13. A shared response schema leaks across a trust boundary.** Two audiences
-reading one endpoint need two response models. The reference implementation gave
-contractors a purpose-built three-field schema (safe by construction) but let
-clients read the team's full task schema — so client contacts who must not see
-money read per-task costs and contractor links. Conditionally blanking fields on
-a shared schema is the exclusion-list pattern from §2.2 and fails the same way.
-(§4.7.)
+**G13. A shared response schema decides a policy question by accident.** Two
+audiences reading one endpoint need two response models. The reference
+implementation gave contractors a purpose-built three-field schema (safe by
+construction) but let clients read the team's full task schema — per-task costs,
+deposits, contractor links — because it was the schema that already existed.
+
+The instructive part is what happened next. That looked like a straightforward
+leak, and under a **markup** revenue model it would have been a serious one: the
+client could compute the margin. But the business turned out to run on
+**pass-through costs plus a flat fee**, under which showing a client what was
+spent on their behalf is not a leak at all — it is the receipt, and arguably
+required.
+
+So the defect was never "clients can see costs". It was that **nobody had
+decided whether they should**, and a schema reused for convenience made the
+decision silently. Reusing a response model across a trust boundary does not
+just risk over-sharing; it quietly answers a policy question that the business
+has not answered yet. Two response models force the question into the open.
+(§4.7, §5.0.)
 
 **G14. Omitted and explicitly-null are not the same PATCH.** Use the parsed
 model's set-fields, not `is not None`, for any nullable clearable field —
@@ -1066,6 +1153,20 @@ checkbox erasing due dates is the canonical instance. (§4.5.)
 transaction. `completed_at` and `paid_in_full` both survive a reopen if you
 forget, corrupting duration metrics and the distributed-money total
 respectively. (§4.6.)
+
+**G16. Settle the revenue model before designing any money view.** Whether a
+client may see costs is not a security question with a right answer — it depends
+entirely on whether you mark costs up or charge a fee on top (§5.0). Build the
+schema first and you will encode an answer by accident, then find months later
+that the client dashboard has been computing your margin for you. Ask "where
+does our revenue come from?" before the first money field exists.
+
+**G17. A party can be under-shared as easily as over-shared.** The same
+implementation that showed clients everything showed vendors **no money at all**
+— not even the value of the contract they signed, because `Contract` had no
+amount field. Isolation reviews reliably hunt for leaks and reliably miss the
+inverse. For each party ask both "what must they not see?" *and* "what do they
+need that they currently cannot get?" (§5.2.)
 
 ---
 
