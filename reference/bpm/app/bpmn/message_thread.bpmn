@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Shape B (§6.4.2) — durable anchor + ledger.
+     The thread parks at ONE catch state and advances only on a terminal
+     signal. Per-member archive/unarchive is unbounded, repeatable and
+     per-actor, so it is written as state_transitions ledger rows
+     (`ledger_transition`) instead of token movements. Looping a token back
+     through a signal catch event is G7. -->
+<bpmn:definitions xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                  xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:camunda="http://camunda.org/schema/1.0/bpmn"
+                  id="Definitions_message_thread"
+                  targetNamespace="https://bpmspec/bpmn">
+
+  <!-- §6.3: signals are declared ONCE at definitions level. -->
+  <bpmn:signal id="sig_delete_thread" name="delete_thread" />
+
+  <bpmn:process id="message_thread" name="Message thread" isExecutable="true">
+    <bpmn:startEvent id="start">
+      <bpmn:outgoing>sf_start</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="sf_start" sourceRef="start" targetRef="state_alive" />
+
+    <bpmn:intermediateCatchEvent id="state_alive" name="Alive — awaiting delete">
+      <bpmn:incoming>sf_start</bpmn:incoming>
+      <bpmn:outgoing>sf_delete</bpmn:outgoing>
+      <bpmn:signalEventDefinition signalRef="sig_delete_thread" />
+    </bpmn:intermediateCatchEvent>
+
+    <bpmn:sequenceFlow id="sf_delete" sourceRef="state_alive" targetRef="svc_delete_thread" />
+    <bpmn:scriptTask id="svc_delete_thread" name="Delete thread">
+      <bpmn:incoming>sf_delete</bpmn:incoming>
+      <bpmn:outgoing>sf_deleted</bpmn:outgoing>
+      <bpmn:script>_dispatch("svc_delete_thread")</bpmn:script>
+    </bpmn:scriptTask>
+    <bpmn:sequenceFlow id="sf_deleted" sourceRef="svc_delete_thread" targetRef="end_deleted" />
+    <bpmn:endEvent id="end_deleted" name="Deleted">
+      <bpmn:incoming>sf_deleted</bpmn:incoming>
+    </bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>

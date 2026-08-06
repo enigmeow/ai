@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Shape A (§6.4.1) — review-and-approve. -->
+<bpmn:definitions xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                  xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:camunda="http://camunda.org/schema/1.0/bpmn"
+                  id="Definitions_blog_post"
+                  targetNamespace="https://bpmspec/bpmn">
+  <bpmn:process id="blog_post" name="Blog post" isExecutable="true">
+
+    <bpmn:startEvent id="start">
+      <bpmn:outgoing>sf_start</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="sf_start" sourceRef="start" targetRef="svc_mark_pending_review" />
+
+    <!-- Law 4: the domain row's `state` column is written ONLY by a handler,
+         never by the router that triggered the start. -->
+    <bpmn:scriptTask id="svc_mark_pending_review" name="Mark pending review">
+      <bpmn:incoming>sf_start</bpmn:incoming>
+      <bpmn:outgoing>sf_to_review</bpmn:outgoing>
+      <bpmn:script>_dispatch("svc_mark_pending_review")</bpmn:script>
+    </bpmn:scriptTask>
+    <bpmn:sequenceFlow id="sf_to_review" sourceRef="svc_mark_pending_review" targetRef="user_admin_review_post" />
+
+    <!-- G24: TWO candidate groups. Keeping only the first would make this task
+         invisible to every senior_instructor, silently. -->
+    <bpmn:userTask id="user_admin_review_post" name="Review blog post"
+                   camunda:candidateGroups="admin,senior_instructor">
+      <bpmn:incoming>sf_to_review</bpmn:incoming>
+      <bpmn:outgoing>sf_decided</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:sequenceFlow id="sf_decided" sourceRef="user_admin_review_post" targetRef="gw_decision" />
+
+    <!-- G22: default= points at the SAFE branch (reject, not publish). -->
+    <bpmn:exclusiveGateway id="gw_decision" name="Approve?" default="sf_reject">
+      <bpmn:incoming>sf_decided</bpmn:incoming>
+      <bpmn:outgoing>sf_approve</bpmn:outgoing>
+      <bpmn:outgoing>sf_reject</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+
+    <bpmn:sequenceFlow id="sf_approve" sourceRef="gw_decision" targetRef="svc_publish_post">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">decision == 'approve'</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="sf_reject" sourceRef="gw_decision" targetRef="svc_reject_post" />
+
+    <bpmn:scriptTask id="svc_publish_post" name="Publish post">
+      <bpmn:incoming>sf_approve</bpmn:incoming>
+      <bpmn:outgoing>sf_published</bpmn:outgoing>
+      <bpmn:script>_dispatch("svc_publish_post")</bpmn:script>
+    </bpmn:scriptTask>
+    <bpmn:sequenceFlow id="sf_published" sourceRef="svc_publish_post" targetRef="end_published" />
+    <bpmn:endEvent id="end_published" name="Published">
+      <bpmn:incoming>sf_published</bpmn:incoming>
+    </bpmn:endEvent>
+
+    <bpmn:scriptTask id="svc_reject_post" name="Reject post">
+      <bpmn:incoming>sf_reject</bpmn:incoming>
+      <bpmn:outgoing>sf_rejected</bpmn:outgoing>
+      <bpmn:script>_dispatch("svc_reject_post")</bpmn:script>
+    </bpmn:scriptTask>
+    <bpmn:sequenceFlow id="sf_rejected" sourceRef="svc_reject_post" targetRef="end_rejected" />
+    <bpmn:endEvent id="end_rejected" name="Rejected">
+      <bpmn:incoming>sf_rejected</bpmn:incoming>
+    </bpmn:endEvent>
+
+  </bpmn:process>
+</bpmn:definitions>

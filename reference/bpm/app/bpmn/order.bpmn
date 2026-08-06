@@ -1,0 +1,123 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Shape C (§6.4.3) — event-based race with a timeout.
+     Without the timeout arm an abandoned checkout parks the workflow forever
+     AND holds its reserved inventory (G15). Without <terminateEventDefinition/>
+     on EVERY end event, the losing arms stay MAYBE, EndJoin never resolves, the
+     instance never leaves `running`, and the timeout handler re-runs every 60
+     seconds forever (G23). -->
+<bpmn:definitions xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                  xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:camunda="http://camunda.org/schema/1.0/bpmn"
+                  id="Definitions_order"
+                  targetNamespace="https://bpmspec/bpmn">
+
+  <bpmn:signal id="sig_payment_captured" name="payment_captured" />
+  <bpmn:signal id="sig_payment_failed"   name="order_payment_failed" />
+  <bpmn:signal id="sig_canceled"         name="canceled" />
+
+  <bpmn:process id="order" name="Order" isExecutable="true">
+    <bpmn:startEvent id="start">
+      <bpmn:outgoing>sf_start</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="sf_start" sourceRef="start" targetRef="svc_reserve_inventory" />
+
+    <bpmn:scriptTask id="svc_reserve_inventory" name="Reserve inventory">
+      <bpmn:incoming>sf_start</bpmn:incoming>
+      <bpmn:outgoing>sf_placed</bpmn:outgoing>
+      <bpmn:script>_dispatch("svc_reserve_inventory")</bpmn:script>
+    </bpmn:scriptTask>
+    <bpmn:sequenceFlow id="sf_placed" sourceRef="svc_reserve_inventory" targetRef="gw_await_payment" />
+
+    <bpmn:eventBasedGateway id="gw_await_payment" name="Await payment">
+      <bpmn:incoming>sf_placed</bpmn:incoming>
+      <bpmn:outgoing>sf_to_captured</bpmn:outgoing>
+      <bpmn:outgoing>sf_to_failed</bpmn:outgoing>
+      <bpmn:outgoing>sf_to_canceled</bpmn:outgoing>
+      <bpmn:outgoing>sf_to_timeout</bpmn:outgoing>
+    </bpmn:eventBasedGateway>
+
+    <bpmn:sequenceFlow id="sf_to_captured"  sourceRef="gw_await_payment" targetRef="evt_payment_captured" />
+    <bpmn:sequenceFlow id="sf_to_failed"    sourceRef="gw_await_payment" targetRef="evt_payment_failed" />
+    <bpmn:sequenceFlow id="sf_to_canceled"  sourceRef="gw_await_payment" targetRef="evt_canceled" />
+    <bpmn:sequenceFlow id="sf_to_timeout"   sourceRef="gw_await_payment" targetRef="timer_payment_timeout" />
+
+    <bpmn:intermediateCatchEvent id="evt_payment_captured" name="Payment captured">
+      <bpmn:incoming>sf_to_captured</bpmn:incoming>
+      <bpmn:outgoing>sf_capture</bpmn:outgoing>
+      <bpmn:signalEventDefinition signalRef="sig_payment_captured" />
+    </bpmn:intermediateCatchEvent>
+
+    <bpmn:intermediateCatchEvent id="evt_payment_failed" name="Payment failed">
+      <bpmn:incoming>sf_to_failed</bpmn:incoming>
+      <bpmn:outgoing>sf_failed</bpmn:outgoing>
+      <bpmn:signalEventDefinition signalRef="sig_payment_failed" />
+    </bpmn:intermediateCatchEvent>
+
+    <bpmn:intermediateCatchEvent id="evt_canceled" name="Admin canceled">
+      <bpmn:incoming>sf_to_canceled</bpmn:incoming>
+      <bpmn:outgoing>sf_canceled</bpmn:outgoing>
+      <bpmn:signalEventDefinition signalRef="sig_canceled" />
+    </bpmn:intermediateCatchEvent>
+
+    <bpmn:intermediateCatchEvent id="timer_payment_timeout" name="Wait 30 min">
+      <bpmn:incoming>sf_to_timeout</bpmn:incoming>
+      <bpmn:outgoing>sf_timeout</bpmn:outgoing>
+      <bpmn:timerEventDefinition>
+        <!-- G11: Spiff EVALUATES this body as Python. The quotes are mandatory. -->
+        <bpmn:timeDuration xsi:type="bpmn:tFormalExpression">"PT30M"</bpmn:timeDuration>
+      </bpmn:timerEventDefinition>
+    </bpmn:intermediateCatchEvent>
+
+    <bpmn:sequenceFlow id="sf_capture"  sourceRef="evt_payment_captured"  targetRef="svc_capture_payment" />
+    <bpmn:sequenceFlow id="sf_failed"   sourceRef="evt_payment_failed"    targetRef="svc_handle_payment_failed" />
+    <bpmn:sequenceFlow id="sf_canceled" sourceRef="evt_canceled"          targetRef="svc_release_and_cancel" />
+    <bpmn:sequenceFlow id="sf_timeout"  sourceRef="timer_payment_timeout" targetRef="svc_timeout_release_and_cancel" />
+
+    <bpmn:scriptTask id="svc_capture_payment" name="Capture payment">
+      <bpmn:incoming>sf_capture</bpmn:incoming>
+      <bpmn:outgoing>sf_paid</bpmn:outgoing>
+      <bpmn:script>_dispatch("svc_capture_payment")</bpmn:script>
+    </bpmn:scriptTask>
+    <bpmn:sequenceFlow id="sf_paid" sourceRef="svc_capture_payment" targetRef="end_paid" />
+
+    <bpmn:scriptTask id="svc_handle_payment_failed" name="Handle payment failure">
+      <bpmn:incoming>sf_failed</bpmn:incoming>
+      <bpmn:outgoing>sf_to_end_failed</bpmn:outgoing>
+      <bpmn:script>_dispatch("svc_handle_payment_failed")</bpmn:script>
+    </bpmn:scriptTask>
+    <bpmn:sequenceFlow id="sf_to_end_failed" sourceRef="svc_handle_payment_failed" targetRef="end_payment_failed" />
+
+    <bpmn:scriptTask id="svc_release_and_cancel" name="Release inventory and cancel">
+      <bpmn:incoming>sf_canceled</bpmn:incoming>
+      <bpmn:outgoing>sf_released</bpmn:outgoing>
+      <bpmn:script>_dispatch("svc_release_and_cancel")</bpmn:script>
+    </bpmn:scriptTask>
+    <bpmn:sequenceFlow id="sf_released" sourceRef="svc_release_and_cancel" targetRef="end_canceled" />
+
+    <bpmn:scriptTask id="svc_timeout_release_and_cancel" name="Abandoned — release and cancel">
+      <bpmn:incoming>sf_timeout</bpmn:incoming>
+      <bpmn:outgoing>sf_timed_out</bpmn:outgoing>
+      <bpmn:script>_dispatch("svc_timeout_release_and_cancel")</bpmn:script>
+    </bpmn:scriptTask>
+    <bpmn:sequenceFlow id="sf_timed_out" sourceRef="svc_timeout_release_and_cancel" targetRef="end_timed_out" />
+
+    <!-- G23: EVERY end event of a process containing an eventBasedGateway MUST
+         terminate. This is enforced statically by tests/test_static_bpmn.py. -->
+    <bpmn:endEvent id="end_paid" name="Order paid">
+      <bpmn:incoming>sf_paid</bpmn:incoming>
+      <bpmn:terminateEventDefinition />
+    </bpmn:endEvent>
+    <bpmn:endEvent id="end_payment_failed" name="Payment failed">
+      <bpmn:incoming>sf_to_end_failed</bpmn:incoming>
+      <bpmn:terminateEventDefinition />
+    </bpmn:endEvent>
+    <bpmn:endEvent id="end_canceled" name="Order canceled">
+      <bpmn:incoming>sf_released</bpmn:incoming>
+      <bpmn:terminateEventDefinition />
+    </bpmn:endEvent>
+    <bpmn:endEvent id="end_timed_out" name="Order abandoned">
+      <bpmn:incoming>sf_timed_out</bpmn:incoming>
+      <bpmn:terminateEventDefinition />
+    </bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>

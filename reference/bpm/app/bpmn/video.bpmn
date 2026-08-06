@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Shape E (§6.4.5) — timer poll loop for async external work, plus the §5.7
+     transient-failure retry protocol.
+     The loop-back goes through a TIMER catch event, which is the one loop-back
+     G7 permits. It is bounded by gw_poll_outcome's give-up branch. -->
+<bpmn:definitions xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                  xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:camunda="http://camunda.org/schema/1.0/bpmn"
+                  id="Definitions_video"
+                  targetNamespace="https://bpmspec/bpmn">
+  <bpmn:process id="video" name="Video" isExecutable="true">
+    <bpmn:startEvent id="start">
+      <bpmn:outgoing>sf_start</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="sf_start" sourceRef="start" targetRef="svc_poll_stream_status" />
+
+    <bpmn:scriptTask id="svc_poll_stream_status" name="Poll stream status">
+      <bpmn:incoming>sf_start</bpmn:incoming>
+      <bpmn:incoming>sf_poll_again</bpmn:incoming>
+      <bpmn:outgoing>sf_polled</bpmn:outgoing>
+      <bpmn:script>_dispatch("svc_poll_stream_status")</bpmn:script>
+    </bpmn:scriptTask>
+    <bpmn:sequenceFlow id="sf_polled" sourceRef="svc_poll_stream_status" targetRef="gw_poll_outcome" />
+
+    <!-- G22: default is the SAFE branch — keep waiting, don't publish. -->
+    <bpmn:exclusiveGateway id="gw_poll_outcome" name="Stream ready?" default="sf_still_waiting">
+      <bpmn:incoming>sf_polled</bpmn:incoming>
+      <bpmn:outgoing>sf_ready</bpmn:outgoing>
+      <bpmn:outgoing>sf_errored</bpmn:outgoing>
+      <bpmn:outgoing>sf_give_up</bpmn:outgoing>
+      <bpmn:outgoing>sf_still_waiting</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+
+    <bpmn:sequenceFlow id="sf_ready" sourceRef="gw_poll_outcome" targetRef="user_owner_publish_decision">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">stream_ready</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="sf_errored" sourceRef="gw_poll_outcome" targetRef="end_error">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">stream_errored</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <!-- §5.7: this condition reads poll_attempt AFTER poll_retry_pending. In the
+         spec's own helper set that ordering is load-bearing (terminal_failure
+         does not set the counters). This build's retry.py sets them on every
+         path, so the ordering here is NOT load-bearing — asserted by
+         tests/test_retry_protocol.py. -->
+    <bpmn:sequenceFlow id="sf_give_up" sourceRef="gw_poll_outcome" targetRef="svc_flag_needs_intervention">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">poll_retry_pending and poll_attempt &gt;= poll_max_attempts</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="sf_still_waiting" sourceRef="gw_poll_outcome" targetRef="timer_wait_30s" />
+
+    <bpmn:intermediateCatchEvent id="timer_wait_30s" name="Wait 30s">
+      <bpmn:incoming>sf_still_waiting</bpmn:incoming>
+      <bpmn:outgoing>sf_poll_again</bpmn:outgoing>
+      <bpmn:timerEventDefinition>
+        <bpmn:timeDuration xsi:type="bpmn:tFormalExpression">"PT30S"</bpmn:timeDuration>
+      </bpmn:timerEventDefinition>
+    </bpmn:intermediateCatchEvent>
+    <bpmn:sequenceFlow id="sf_poll_again" sourceRef="timer_wait_30s" targetRef="svc_poll_stream_status" />
+
+    <bpmn:scriptTask id="svc_flag_needs_intervention" name="Flag for human intervention">
+      <bpmn:incoming>sf_give_up</bpmn:incoming>
+      <bpmn:outgoing>sf_flagged</bpmn:outgoing>
+      <bpmn:script>_dispatch("svc_flag_needs_intervention")</bpmn:script>
+    </bpmn:scriptTask>
+    <bpmn:sequenceFlow id="sf_flagged" sourceRef="svc_flag_needs_intervention" targetRef="end_needs_intervention" />
+
+    <bpmn:userTask id="user_owner_publish_decision" name="Publish video?"
+                   camunda:assignee="owner_user_id" camunda:candidateGroups="admin">
+      <bpmn:incoming>sf_ready</bpmn:incoming>
+      <bpmn:outgoing>sf_decided</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:sequenceFlow id="sf_decided" sourceRef="user_owner_publish_decision" targetRef="svc_publish_video" />
+
+    <bpmn:scriptTask id="svc_publish_video" name="Publish video">
+      <bpmn:incoming>sf_decided</bpmn:incoming>
+      <bpmn:outgoing>sf_published</bpmn:outgoing>
+      <bpmn:script>_dispatch("svc_publish_video")</bpmn:script>
+    </bpmn:scriptTask>
+    <bpmn:sequenceFlow id="sf_published" sourceRef="svc_publish_video" targetRef="end_published" />
+
+    <bpmn:endEvent id="end_published" name="Published">
+      <bpmn:incoming>sf_published</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:endEvent id="end_error" name="Transcode error">
+      <bpmn:incoming>sf_errored</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:endEvent id="end_needs_intervention" name="Needs intervention">
+      <bpmn:incoming>sf_flagged</bpmn:incoming>
+    </bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>

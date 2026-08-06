@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                  xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:camunda="http://camunda.org/schema/1.0/bpmn"
+                  id="Definitions_p2" targetNamespace="https://probe/bpmn">
+  <bpmn:signal id="sig_go" name="go" />
+  <bpmn:process id="p2" isExecutable="true">
+    <bpmn:startEvent id="start"><bpmn:outgoing>sf_start</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:sequenceFlow id="sf_start" sourceRef="start" targetRef="user_admin_review" />
+    <bpmn:userTask id="user_admin_review" name="Review" camunda:candidateGroups="admin,senior_instructor" camunda:assignee="owner_user_id">
+      <bpmn:incoming>sf_start</bpmn:incoming><bpmn:outgoing>sf_d</bpmn:outgoing>
+    </bpmn:userTask>
+    <bpmn:sequenceFlow id="sf_d" sourceRef="user_admin_review" targetRef="state_wait" />
+    <bpmn:intermediateCatchEvent id="state_wait">
+      <bpmn:incoming>sf_d</bpmn:incoming><bpmn:outgoing>sf_e</bpmn:outgoing>
+      <bpmn:signalEventDefinition signalRef="sig_go" />
+    </bpmn:intermediateCatchEvent>
+    <bpmn:sequenceFlow id="sf_e" sourceRef="state_wait" targetRef="end_ok" />
+    <bpmn:endEvent id="end_ok"><bpmn:incoming>sf_e</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>

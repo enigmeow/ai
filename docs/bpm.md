@@ -2352,6 +2352,15 @@ each transition; BPML → BPEL → BPMN 2.0 followed, and every modern engine
 - [BPML](https://en.wikipedia.org/wiki/Business_Process_Modeling_Language) · [BPMN](https://en.wikipedia.org/wiki/Business_Process_Model_and_Notation)
 - [State Machines and Business Process and Workflow](https://dobbse.net/thinair/2004/10/business-process.html)
 
+**Working code for this document**
+- [`reference/bpm/`](../reference/bpm/) — a clean-room implementation built from
+  this spec alone. Use it three ways: as a **conformance suite**
+  (`tests/test_gotchas_engine.py` checks §12's claims against the engine version
+  you are actually running), as a **worked answer** to the two problems this
+  document states but does not solve (§5.3's error durability, §7.6's signal
+  recovery), and as a **propagation check** — a change here that contradicts
+  working code fails a test instead of quietly rotting (§14.6).
+
 **Companion specs in this repo**
 - `docs/mcp.md` — **the agent-facing tool surface over `WorkflowService`.** Subtitled
   "Admin Tooling over the BPMN Spine"; §7.7 here is its one-paragraph summary. Read it

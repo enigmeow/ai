@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                  xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:camunda="http://camunda.org/schema/1.0/bpmn"
+                  id="Definitions_probe" targetNamespace="https://probe/bpmn">
+  <bpmn:process id="probe" name="Probe" isExecutable="true">
+    <bpmn:startEvent id="start"><bpmn:outgoing>sf_start</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:sequenceFlow id="sf_start" sourceRef="start" targetRef="svc_do" />
+    <bpmn:scriptTask id="svc_do" name="Do">
+      <bpmn:incoming>sf_start</bpmn:incoming><bpmn:outgoing>sf_done</bpmn:outgoing>
+      <bpmn:script>_dispatch("svc_do")</bpmn:script>
+    </bpmn:scriptTask>
+    <bpmn:sequenceFlow id="sf_done" sourceRef="svc_do" targetRef="end_ok" />
+    <bpmn:endEvent id="end_ok" name="Done"><bpmn:incoming>sf_done</bpmn:incoming></bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>
