@@ -270,147 +270,26 @@ index the pair, because every query is "the rows for *this* entity".
 
 ---
 
-## 4.5 The payment integration in detail
+## 4.5 The payment integration
 
-Generic advice about "adapters" stops being useful at some point. This is the
-concrete shape of a card-payment integration, and the parts that are easy to get
-wrong.
+Promoted to its own document: **[`docs/stripe.md`](stripe.md)**.
 
-### 4.5.1 Idempotency keys are the whole safety mechanism
+The provider-agnostic reasoning stays here — three modes (§2.1), the fake as
+production code (§2.2), config precedence (§2.5), the factory as the only entry
+point (§2.6). What is specific to talking to a card processor moved, because it
+is useful to someone who is not building a storefront at all:
 
-**Get this wrong and you take money twice.** Every mutating call carries a key;
-the provider dedups against it for 24 hours and returns the *original* result
-instead of acting again.
+| Need | See |
+|---|---|
+| The object model — intent, charge, balance transaction, session | `stripe.md` §2 |
+| Call sequences for hosted checkout, own-form, refund | `stripe.md` §3 |
+| **Which webhook events to handle and what to do with each** | `stripe.md` §4 |
+| **Which errors are worth retrying** | `stripe.md` §5 |
+| Idempotency keys done properly | `stripe.md` §6 |
+| The retry-after-failure problem | `stripe.md` §7 |
+| Connect, setup, testing | `stripe.md` §8–§9 |
 
-```python
-def stripe_idempotency_key(*, site, object_id, op, attempt=1) -> str:
-    return f"{site}:{object_id}:{op}:{attempt}"
-```
-
-Four properties, each load-bearing:
-
-- **Deterministic.** The same logical operation on the same object must produce
-  the same key. Any random component disables deduplication completely.
-- **Scoped by site/tenant**, so two products sharing one provider account cannot
-  collide on a shared object id.
-- **Scoped by operation**, so `capture` and `refund` on one intent differ.
-- **An explicit `attempt`**, which is the subtle one — see below.
-
-**`attempt` distinguishes two things that look identical from inside a retry
-loop:**
-
-| Situation | Key | Why |
-|---|---|---|
-| Network blip, 5xx, workflow loop-back | **same** | You want the provider to dedup. Acting twice is the bug. |
-| Previous attempt failed *permanently*, buyer retries with another card | **new** | You genuinely want a second provider object. |
-
-A retry protocol (`docs/bpm.md` §5.7) increments a counter on **transient**
-failure — so **do not feed that counter into the key.** Doing so re-enables
-double-charging on exactly the path idempotency exists to protect.
-
-**And key on your own request identity, not on the amount.** Two legitimate
-partial refunds *of the same amount* will otherwise share a key: the provider
-dedups the second into the first, and the buyer gets half their money. Pass the
-id of *your* refund request.
-
-> **A real bug, and how it hid.** The reference implementation had a correct
-> deterministic helper **used nowhere**, beside a live one that appended
-> `uuid.uuid4().hex[:8]` — with a docstring asserting that retries returned the
-> same result. Every key was unique, so nothing ever dedup'd. Because the refund
-> handler sits on a retry-protocol loop-back, a transient 5xx would have issued
-> a **second real refund**, and the dedup guard downstream keyed off the
-> provider's refund id — which a genuine duplicate carries a *new* value for.
->
-> Two lessons. **A dead correct implementation beside a live incorrect one is
-> worse than no implementation**, because the correct one satisfies review.
-> And **no test can catch this by calling the function once** — you need two
-> calls, or better, two separately-constructed adapters, and to assert they
-> agree.
-
-### 4.5.2 Intents versus hosted checkout
-
-Two integration styles, and the choice drives everything downstream:
-
-| | You host the form | Provider hosts checkout |
-|---|---|---|
-| Create | `payment_intents.create` | `checkout.sessions.create` |
-| Card data | Never touches your server (tokenised client-side) | Never touches your server |
-| 3-D Secure | You handle the `requires_action` round-trip | Provider handles it |
-| Abandonment | Your problem | Session has its own expiry event |
-| Correlation id | `pi_…` from the start | `cs_…` first, `pi_…` **later** |
-
-That last row is a real trap. With hosted checkout the PaymentIntent may not
-exist when the session is created, so your payment row stores the **session**
-id and is rewritten to the intent id when the provider materialises one. **Any
-lookup must try both**, or you miss precisely the events you care about — an
-expired session is the case where the intent may never have existed at all.
-
-Expand the intent at creation (`expand: ["payment_intent"]`) so you get it
-inline where possible, and tolerate both shapes: expanded, it is an object;
-unexpanded, a bare string.
-
-### 4.5.3 One client per adapter instance, never a module global
-
-```python
-self._client = stripe.StripeClient(api_key=secret_key, base_addresses={...})
-```
-
-The SDK offers a module-level `stripe.api_key`. Don't use it. A per-instance
-client means credentials cannot leak between sites in one process, or between
-tests in one run — and it is what makes `base_addresses` redirection possible,
-which is how the whole checkout path runs offline against a local API mock in
-`test` mode.
-
-### 4.5.4 Use `expand` to avoid N+1 round-trips
-
-Fees and settlement live on the balance transaction, one hop past the charge:
-
-```python
-params={"expand": ["latest_charge.balance_transaction"]}
-```
-
-One call returns the intent, the charge, the card metadata, the risk signals and
-the fee split — everything §4's wide `Payment` row wants. Without it you make
-three calls and get to reconcile them yourself.
-
-### 4.5.5 Webhook verification, and the object-access trap
-
-```python
-event = stripe.Webhook.construct_event(payload=raw_bytes, sig_header=sig,
-                                       secret=self._webhook_secret)
-```
-
-Verify against the **raw body**. A framework that has already parsed and
-re-serialised the JSON will produce a different byte string and every signature
-will fail — this is the single most common webhook integration bug.
-
-Then, a library detail worth stating because it is silent: the SDK's response
-objects are dict-*like* through `[]`, but **not safe under `.get()` or attribute
-access for missing keys**. Access with `[]` inside `try/except KeyError` for
-optional paths. Reaching for `.get()` gets you `None` where you expected a
-`KeyError`, and the bug surfaces three layers away.
-
-Normalise into your own DTO at the boundary — `id`, `type`, the correlation id,
-and the raw object — so nothing downstream depends on the provider's shape.
-
-### 4.5.6 Refunds reverse more than the amount
-
-A refund on a marketplace-style charge should also reverse the platform fee
-proportionally, which the provider does *if you ask*. Refunds are also the most
-common source of duplicate side effects, because they are the operation people
-retry by hand when they are unsure whether the first one worked. Dedup on your
-own refund row (`provider_refund_id`) **as well as** keying the API call
-correctly — belt and braces, because these are the errors customers notice.
-
-### 4.5.7 Connect / multi-party, if you need it
-
-Destination charges (`transfer_data.destination` plus
-`application_fee_amount`) settle the seller's share automatically, and a later
-refund with `refund_application_fee=True` reverses proportionally. Onboarding is
-its own lifecycle — account created, requirements outstanding, capabilities
-enabled, deauthorised — driven by `account.updated` webhooks, and it deserves a
-workflow rather than a status column. Transfers and reversals need their own
-idempotency keys for the same reasons as §4.5.1.
+§5 and §6 there are the two that cost real money if you get them wrong.
 
 ---
 
