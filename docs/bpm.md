@@ -606,6 +606,25 @@ nothing is running. A webhook arriving for a workflow that already ended is a
 normal, expected no-op, and treating it as an error is how you page yourself at
 2am for nothing.
 
+**But `None` has two meanings and you must separate them (G25).** *No instance
+at all* is routine. *An instance exists and is not running* means a workflow has
+gone permanently deaf — every later signal for that object is discarded, in
+silence, forever. Log the first at DEBUG and the second at WARNING with the
+statuses you skipped:
+
+```python
+if instance is None:
+    others = (self.db.query(ProcessInstance.id, ProcessInstance.status)
+                .filter(ProcessInstance.object_type == object_type,
+                        ProcessInstance.object_id == object_id).limit(5).all())
+    if not others:
+        log.debug("signal %r dropped: no instance for %s %s", ...)   # routine
+    else:
+        log.warning("signal %r DROPPED for %s %s — instance(s) exist but none "
+                    "are running: %s", ...)                          # diverged
+    return None
+```
+
 **`available_actions(business_key, user)`** is what makes generic UI possible.
 It returns the transitions *this user* can trigger right now: ready user tasks
 they may claim/complete (matched on `assignee_user_id` or role), plus the
@@ -646,8 +665,10 @@ def _catchable_signals(workflow) -> list[str]:
 `workflow_tasks`: rows whose task is no longer ready are closed, genuinely-new
 ready tasks get rows plus a `task_started` audit entry, and rows for tasks still
 ready are left alone (preserving a claim). Assignment is resolved at projection
-time: `camunda:candidateGroups` → `assignee_role` (first entry);
-`camunda:assignee` holds the **name of a workflow variable**
+time: `camunda:candidateGroups` → `assignee_role` as a **comma-separated list,
+preserving every group** — take only the first and every other candidate role
+silently loses the task (G24); match with a split-and-any helper, never `==` or
+a SQL `IN`. `camunda:assignee` holds the **name of a workflow variable**
 (e.g. `owner_user_id`) which is resolved against task/workflow data → 
 `assignee_user_id`. Keep it a bare variable name — no Jinja/`${}` interpolation.
 
@@ -1233,8 +1254,10 @@ Four rules, each learned the expensive way:
    when asking "what does Stripe tell us and what do we do about it."
 2. **Correlate by `(object_type, object_id)`, not by process key.** The webhook
    doesn't know or care which process is running.
-3. **No running instance is a no-op, not an error.** Late webhooks for finished
-   workflows are normal.
+3. **No running instance is a no-op, not an error — but say which kind.** Late
+   webhooks for finished workflows are normal. An instance that exists in
+   `error` is not: it will swallow every future signal silently (G25). Log the
+   two cases differently or you will not find out for months.
 4. **Never fail the webhook on a workflow error.** Return 200 and log. A
    provider that gets a 500 retries with backoff and eventually disables your
    endpoint. The domain row update and the signal are separate concerns; do the
@@ -1872,7 +1895,8 @@ Two further consequences worth knowing:
   cancel the strays by hand.
 
 Guard it statically — the rule is mechanical, so a test can enforce it across
-every definition rather than trusting review:
+every definition rather than trusting review (see also G24–G26, which were found
+by *implementing* these fixes rather than by reviewing the document):
 
 ```python
 for path in all_bpmn():
@@ -1889,6 +1913,84 @@ for path in all_bpmn():
 > true: switch every parse path (the loader in §5.4 included) to
 > `defusedxml.ElementTree`, or you have handed them XXE and entity-expansion
 > against the process that runs your workflows.
+
+**G24. `camunda:candidateGroups` is a LIST — keep all of it.** Projecting only
+`split(",")[0]` into `assignee_role` means a task declaring
+`candidateGroups="admin,senior_instructor"` is stored as `admin`, so senior
+instructors never see it in their inbox and get 403 trying to claim it. The
+second and subsequent groups vanish with no error anywhere.
+
+Store the whole comma-separated list and match with a helper, in **every** place
+that reads it — the inbox query, the task-visibility check, claim,
+`available_actions`, and any agent/MCP filter:
+
+```python
+def role_names_of(assignee_role):            # "admin,senior_instructor"
+    return [r.strip() for r in (assignee_role or "").split(",") if r.strip()]
+
+def user_matches_role(assignee_role, user):
+    return any(user.has_role(r) for r in role_names_of(assignee_role))
+```
+
+Note this breaks SQL `IN` matching on the column, so the inbox query must narrow
+in SQL and refine in Python (inboxes are small; correctness wins). Single-role
+rows written before the change split to a one-element list, so the migration is
+free.
+
+**G25. An errored instance is permanently, silently deaf.** This is the most
+dangerous emergent behaviour in the design, because three separate "correct"
+decisions compose into it:
+
+```
+_advance()               a handler raises  →  instance.status = "error"
+signal_by_correlation()  .filter(status == "running")  →  no match  →  None
+webhook                  if instance is not None: ...  ← no else, no log
+```
+
+**One handler exception disconnects a workflow from every future event, for
+ever, without a single log line.** Traced in production: an order's payment
+declined at T+7min, the cancel handler raised on a missing column, the instance
+went to `error` — and the `payment_intent.succeeded` that arrived 3.5 minutes
+later was discarded. The order was paid and shipped; its workflow sat frozen at
+the payment gateway for three months. Nothing anywhere recorded that a signal had
+been thrown away.
+
+Mitigations, in order of value:
+
+1. **Log the discard** and distinguish "no instance" from "instance not running"
+   (§5.3). Cheapest, and would have surfaced this the same day.
+2. **Make `error` recoverable.** If `retry_failed_task` is unimplemented (as it
+   is here — §14.3), an errored instance is *both* invisible and unfixable.
+3. **Alert on `status='error'`.** Nothing surfaces it; three instances sat
+   there for months.
+4. Consider whether signals should reach errored instances at all, or whether
+   an error should park the instance in a state that can still catch events.
+
+**G26. A handler must re-derive safety from the domain object, never trust its
+trigger.** A signal describes what was true when it was *sent*; a handler runs
+when it *runs*, which may be much later — after a retry, a re-driven instance,
+or a sweep. In between, the object moves on.
+
+Concretely: `payment_failed` routed straight to "cancel the order and release
+its inventory". But a failed payment attempt is retryable — the buyer tried
+another card and succeeded — so by the time a re-run reached the handler the
+order was paid and shipped. Cancelling on the strength of the stale trigger
+would have released the stock of goods already dispatched.
+
+So a destructive handler needs a guard derived from the object's *current*
+state, not from the reason it was invoked:
+
+```python
+def _cancel_block_reason(order):
+    if order.payment_status in PAID_STATUSES:      return f"payment_{order.payment_status}"
+    if order.fulfillment_status in SHIPPED_STATUSES: return f"fulfillment_{order.fulfillment_status}"
+    if order.state == "canceled":                  return "already_canceled"
+    return None
+```
+
+This is G10 (short-circuit on every terminal state) generalised from loop bodies
+to **any handler reachable more than once or late**. Log the refusal, so a guard
+that fires is visible rather than silent.
 
 ---
 
@@ -2024,6 +2126,22 @@ were live in the reference implementation, **every one of which fails silently**
 | `_catchable_signals` read `event_definitions` | `available_actions()` never returned a signal, for any workflow, ever |
 | `candidateGroups` kept only the first entry | Multi-group tasks invisible to every role but the first-listed |
 | `data_objects.update(seed)` | Dead line with a comment asserting the opposite (§5.3) |
+
+### 14.5 Found by *implementing* those fixes
+
+The review found what was wrong with the document. Applying the fixes to the
+running system found more — which is the argument for making an unbriefed
+reviewer **build** rather than read:
+
+| Found | Recorded as |
+|---|---|
+| An errored instance silently swallows every later signal, permanently. One handler exception froze a paid order's workflow for three months | **G25** |
+| A handler must re-derive safety from the domain object; a stale trigger nearly cancelled a shipped order | **G26** |
+| The `candidateGroups` fix has to reach five call sites, and breaks SQL `IN` matching on the column | **G24** |
+| `signal_by_correlation` returning `None` conflates "no workflow" with "diverged workflow" | §5.3, §7.2 |
+
+None of these is visible from the document alone. They only appear when the
+fixes meet real data.
 
 All five are corrected in the text above. The lesson generalises past BPM:
 **a briefed reviewer inherits the briefer's blind spots.** Every one of these
